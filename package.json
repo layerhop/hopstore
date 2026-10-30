@@ -1,0 +1,62 @@
+{
+  "name": "hopstore",
+  "version": "0.1.0",
+  "description": "Embedded storage engine for Node.js: in-memory tables made durable by a local WAL and Parquet on S3-compatible storage.",
+  "license": "Apache-2.0",
+  "author": "Omer Maksuti",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/layerhop/hopstore.git"
+  },
+  "homepage": "https://github.com/layerhop/hopstore#readme",
+  "bugs": {
+    "url": "https://github.com/layerhop/hopstore/issues"
+  },
+  "keywords": [
+    "storage",
+    "database",
+    "embedded",
+    "s3",
+    "parquet",
+    "wal",
+    "in-memory",
+    "key-value",
+    "object-storage",
+    "durable"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p .",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "aws4fetch": "1.0.20",
+    "hyparquet": "1.31.4",
+    "hyparquet-writer": "0.16.12"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "typescript": "5.9.3",
+    "vitest": "3.2.7"
+  }
+}

@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  # The full suite, including the S3 tests, against a local S3-compatible server (no cloud keys needed).
+  s3:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Start SeaweedFS S3
+        run: |
+          echo '{"identities":[{"name":"ci","credentials":[{"accessKey":"hopstore","secretKey":"hopstore-secret"}],"actions":["Admin","Read","Write","List","Tagging"]}]}' > /tmp/s3.json
+          docker run -d --name s3 -p 8333:8333 -v /tmp/s3.json:/etc/s3.json chrislusf/seaweedfs:4.50 server -dir=/data -s3 -s3.port=8333 -s3.config=/etc/s3.json
+          for i in $(seq 60); do curl -s -o /dev/null http://127.0.0.1:8333/ && break; sleep 1; done
+          curl -sf --aws-sigv4 "aws:amz:us-east-1:s3" --user hopstore:hopstore-secret -X PUT http://127.0.0.1:8333/hopstore-ci
+      - run: npm ci
+      - run: npm test
+        env:
+          HOPSTORE_LIVE_S3: "1"
+          S3_ENDPOINT: http://127.0.0.1:8333
+          S3_REGION: us-east-1
+          S3_BUCKET: hopstore-ci
+          S3_ACCESS_KEY_ID: hopstore
+          S3_SECRET_ACCESS_KEY: hopstore-secret
