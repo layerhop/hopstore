@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Json } from "./codec.js";
+import { readLogParquetGroups, type RowCodec } from "./log-table.js";
 import { MemoryObjectStore } from "./memory-store.js";
+import { bytesBuffer } from "./parquet.js";
 import { Store, type StoreOptions } from "./store.js";
 
 const dirs: string[] = [];
@@ -289,7 +291,7 @@ describe("LogTable", () => {
     expect(blocks(await all(s2.logTable<Trade>("trades").scan({ partition: "A", from: [0], to: [100] })))).toEqual(want);
   });
 
-  it("a flush that adopts a landed seal drops the sealed rows from memory", async () => {
+  it("a flush that adopts a landed seal drops the sealed rows from memory; sealsInDoubt counts the seal until then", async () => {
     const objects = new MemoryObjectStore();
     const realPut = objects.put.bind(objects);
     let lose = false;
@@ -304,10 +306,15 @@ describe("LogTable", () => {
     const s = await openStore(opts(objects, await tmp(), { flushMs: 1_000_000 }));
     const log = s.logTable<Trade>("trades");
     await s.commit(Array.from({ length: 6 }, (_, b) => append("A", b)));
+    expect(s.sealsInDoubt()).toBe(0);
     lose = true;
     await expect(s.sealLogs()).rejects.toThrow(/lost response/);
+    expect(s.sealsInDoubt()).toBe(1);
+    expect(await s.sealLogs({ where: () => false })).toBe(0); // an empty seal settles nothing
+    expect(s.sealsInDoubt()).toBe(1);
     await s.commit([append("A", 6)]);
     await s.flush(); // creates the slot the seal used: adopts it
+    expect(s.sealsInDoubt()).toBe(0);
     expect(log.size).toBe(4);
     const want = [0, 1, 2, 3, 4, 5, 6];
     expect(blocks(await all(log.scan({ partition: "A", from: [0], to: [100] })))).toEqual(want);
@@ -315,6 +322,26 @@ describe("LogTable", () => {
     expect(blocks(await all(log.scan({ partition: "A", from: [0], to: [100] })))).toEqual(want);
     const s2 = await openStore(opts(objects, await tmp()));
     expect(blocks(await all(s2.logTable<Trade>("trades").scan({ partition: "A", from: [0], to: [100] })))).toEqual(want);
+  });
+
+  it("a failed seal whose manifest never landed stops counting in sealsInDoubt once a later publish takes its slot", async () => {
+    const objects = new MemoryObjectStore();
+    const realPut = objects.put.bind(objects);
+    let fail = false;
+    objects.put = async (key, body, o) => {
+      if (fail && key.includes("/manifest/")) throw new Error("manifest PUT failed");
+      return realPut(key, body, o);
+    };
+    const s = await openStore(opts(objects, await tmp(), { flushMs: 1_000_000 }));
+    await s.commit(Array.from({ length: 6 }, (_, b) => append("A", b)));
+    fail = true;
+    await expect(s.sealLogs()).rejects.toThrow(/manifest PUT failed/);
+    expect(s.sealsInDoubt()).toBe(1);
+    fail = false;
+    await s.commit([append("B", 1)]);
+    await s.flush(); // its manifest takes the slot: the failed seal can no longer land
+    expect(s.sealsInDoubt()).toBe(0);
+    expect(s.logTable("trades").size).toBe(7); // nothing left memory
   });
 
   it("scan spans many row groups and merges interleaved segments", async () => {
@@ -329,6 +356,93 @@ describe("LogTable", () => {
     expect(rows.length).toBe(30_001);
     expect(rows.slice(0, 5).map((r) => [r.b, r.i])).toEqual([[5, 0], [6, 0], [7, 0], [7, 1], [8, 0]]);
     for (let i = 1; i < rows.length; i++) expect(rows[i]!.b >= rows[i - 1]!.b).toBe(true);
+  });
+
+  it("seal callbacks see the partition", async () => {
+    const s = await openStore(opts(new MemoryObjectStore(), await tmp()));
+    const log = s.logTable<Trade>("trades");
+    await s.commit([6, 2, 4, 1, 5, 3].map((b) => append("A", b))); // tail 4, 5, 6; waiting 1, 2, 3
+    await s.commit([1, 2, 3, 4].map((b) => append("B", b))); // tail 2, 3, 4; waiting 1
+    const seen: string[] = [];
+    // only partition B: its waiting row, and its tail row 4 by evict
+    const n = await s.sealLogs({ where: (_, p) => (seen.push(`w${p}`), p === "B"), evict: (r, p) => (seen.push(`e${p}`), p === "B" && (r as Trade).b === 4) });
+    expect(n).toBe(2);
+    expect(seen).toContain("wA");
+    expect(seen).toContain("eB");
+    expect([blocks([...log.memoryRows("A")]), blocks([...log.memoryRows("B")])]).toEqual([[1, 2, 3, 4, 5, 6], [2, 3]]);
+  });
+
+  it("tables limits a seal to those log tables: the others keep their waiting rows and see no callback", async () => {
+    const extra = { tables: { state: ["meta"], log: [{ name: "trades", keepPerPartition: 3, sortKey }, { name: "fills", keepPerPartition: 0, sortKey }] } };
+    const objects = new MemoryObjectStore();
+    const s = await openStore(opts(objects, await tmp(), extra));
+    const fill = (b: number) => ({ ...append("F", b), table: "fills" });
+    await s.commit([...[1, 2, 3, 4, 5].map((b) => append("A", b)), fill(1), fill(2)]); // waiting A1, A2; F1, F2
+    const seen: string[] = [];
+    const where = (r: Json, p: string, table: string) => (seen.push(`${table}:${p}${(r as Trade).b}`), true);
+    expect(await s.sealLogs({ tables: ["fills"], where, withOps: (rows) => (seen.push(`ops${rows.map(([, , t]) => t).join()}`), []) })).toBe(2);
+    expect(seen).toEqual(["fills:F1", "fills:F2", "opsfills,fills"]);
+    // a withOps callback typed for [partition, row] pairs (before the table was added) still fits
+    const pairs = (rows: [string, Json][]) => (seen.push(`pairs${rows.length}`), []);
+    await s.commit([fill(3)]);
+    expect(await s.sealLogs({ tables: ["fills"], withOps: pairs })).toBe(1);
+    expect(seen.at(-1)).toBe("pairs1");
+    expect([s.logTable("trades").size, s.logTable("fills").size]).toEqual([5, 0]);
+    const filled = [1, 2, 3];
+    expect(await s.sealLogs({ tables: [] })).toBe(0);
+    expect(s.logTable("trades").size).toBe(5);
+    await expect(s.sealLogs({ tables: ["nope"] })).rejects.toThrow(/nope/);
+    expect(await s.sealLogs({ tables: ["trades"] })).toBe(2);
+    expect(blocks(await all(s.logTable<Trade>("fills").scan({ partition: "F", from: [0], to: [9] })))).toEqual(filled);
+    await s.close();
+    const again = await openStore(opts(objects, await tmp(), extra));
+    expect(blocks(await all(again.logTable<Trade>("fills").scan({ partition: "F", from: [0], to: [9] })))).toEqual(filled);
+    expect(blocks(await all(again.logTable<Trade>("trades").scan({ partition: "A", from: [0], to: [9] })))).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("withOps commits ops built from exactly the rows a seal takes, in the snapshot it publishes", async () => {
+    let hold: (() => void) | null = null;
+    const objects = new (class extends MemoryObjectStore {
+      override async put(...args: Parameters<MemoryObjectStore["put"]>) {
+        if (hold) await new Promise<void>((r) => (hold = r));
+        return super.put(...args);
+      }
+    })();
+    const s = await openStore(opts(objects, await tmp()));
+    await s.commit([1, 2, 3, 4].map((b) => append("A", b)), { durable: "s3" }); // waiting A1
+    hold = () => {};
+    const flushing = s.commit([append("B", 1)], { durable: "s3" }); // its upload holds the S3 lane
+    await new Promise((r) => setTimeout(r, 50));
+    let seen: string[] = [];
+    const sealing = s.sealLogs({ withOps: (rows) => ((seen = rows.map(([p, r]) => `${p}${(r as Trade).b}`)), [{ t: "put", table: "meta", key: "sealed", value: seen.length }]) });
+    await s.commit([5, 6].map((b) => append("A", b))); // A2, A3 start waiting before the seal starts
+    expect(seen).toEqual([]);
+    while (hold) {
+      const h: () => void = hold;
+      hold = null;
+      h();
+    }
+    await flushing;
+    expect(await sealing).toBe(3);
+    expect(seen).toEqual(["A1", "A2", "A3"]);
+    expect(s.stateTable("meta").get("sealed")).toBe(3);
+    await s.close();
+    const again = await openStore(opts(objects, await tmp())); // from S3 alone
+    expect(again.stateTable("meta").get("sealed")).toBe(3);
+    expect(blocks(await all(again.logTable<Trade>("trades").scan({ partition: "A", from: [0], to: [100] })))).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+
+  it("scanEntries yields each row with its partition, memory merged with segments", async () => {
+    const s = await openStore(opts(new MemoryObjectStore(), await tmp()));
+    const log = s.logTable<Trade>("trades");
+    await s.commit([1, 2, 3, 4, 5].map((b) => append("A", b)));
+    await s.commit([2, 9].map((b) => append("B", b)));
+    await s.sealLogs(); // A1, A2 sealed
+    const got = await all(log.scanEntries({ from: [2], to: [9] }));
+    expect(got.map(([p, r]) => `${p}${r.b}`)).toEqual(["A2", "A3", "A4", "A5", "B2"]);
+    expect((await all(log.scanEntries({ partition: "B", from: [0], to: [100] }))).map(([p, r]) => `${p}${r.b}`)).toEqual(["B2", "B9"]);
+    // the same rows as scan
+    expect((await all(log.scanEntries({ from: [0], to: [100] }))).map(([, r]) => r)).toEqual(await all(log.scan({ from: [0], to: [100] })));
   });
 
   it("validates appends and refuses undeclared log tables on open", async () => {
@@ -348,5 +462,142 @@ describe("LogTable", () => {
     await s2.close();
     await expect(s2.sealLogs()).rejects.toThrow(/closed/);
     await expect(Store.open(opts(objects, await tmp(), { tables: { state: ["meta"] } }))).rejects.toThrow(/undeclared table trades/);
+  });
+
+  describe("codec (rows packed in memory)", () => {
+    /** Packs a trade as "b|i|v"; counts its calls. */
+    const counted = () => {
+      const n = { pack: 0, unpack: 0 };
+      const codec: RowCodec = {
+        pack: (r) => {
+          n.pack++;
+          const t = r as Trade;
+          return `${t.b}|${t.i}|${t.v}`;
+        },
+        unpack: (p) => {
+          n.unpack++;
+          const [b, i, v] = p.split("|");
+          return { b: Number(b), i: Number(i), v: v! };
+        },
+      };
+      return { codec, n };
+    };
+    const withCodec = (codec: RowCodec | undefined) => ({ tables: { state: ["meta"], log: [{ name: "trades", keepPerPartition: 3, sortKey, codec }] } });
+    /** Every read of the table, as one comparable value. */
+    const reads = async (s: Store) => {
+      const log = s.logTable<Trade>("trades");
+      return {
+        size: log.size,
+        latest: [log.latest("A", 10), log.latest("A", 2, (r) => r.b !== 6), log.latest("B", 10)],
+        memory: [[...log.memoryRows("A")], [...log.rowsInMemory("A")].sort((x, y) => x.b - y.b), [...log.memoryRows("B")]],
+        scan: await all(log.scan({ from: [0], to: [100] })),
+        entries: await all(log.scanEntries({ partition: "A", from: [2], to: [9] })),
+        has: [log.has("A", [6, 0]), log.has("A", [1, 0]), log.has("B", [7, 0])],
+      };
+    };
+    const fill = async (s: Store) => {
+      await s.commit([6, 2, 4, 1, 5, 3].map((b) => append("A", b)));
+      await s.commit([7, 8].map((b) => append("B", b)));
+      await s.sealLogs({ where: (r) => (r as Trade).b < 2 }); // A1 into a segment
+      await s.commit([append("A", 9), append("B", 7, 1)]);
+    };
+
+    it("holds rows packed, reads them decoded exactly like a table without one; stored data is the same either way", async () => {
+      const { codec, n } = counted();
+      const plain = await openStore(opts(new MemoryObjectStore(), await tmp()));
+      const objects = new MemoryObjectStore();
+      const packed = await openStore(opts(objects, await tmp(), withCodec(codec)));
+      await fill(plain);
+      await fill(packed);
+      expect(n.pack).toBeGreaterThan(0);
+      expect([...packed.logTable("trades").packedRowsInMemory("B")].sort()).toEqual(["7|0|B7.0", "7|1|B7.1", "8|0|B8.0"]);
+      expect([...plain.logTable("trades").packedRowsInMemory("B")]).toEqual([...plain.logTable("trades").rowsInMemory("B")]);
+      const want = await reads(plain);
+      expect(await reads(packed)).toEqual(want);
+      // a row read is a decoded copy: changing it changes nothing held
+      (packed.logTable<Trade>("trades").latest("A", 1)[0] as { v: string }).v = "changed";
+      expect(await reads(packed)).toEqual(want);
+      // snapshot, segments and WAL hold the rows themselves: a store without the codec reads them, and back
+      await packed.snapshot();
+      await packed.commit([append("B", 10)]);
+      await packed.flush();
+      const bare = await openStore(opts(objects, await tmp()));
+      const snap = (await readLogParquetGroups(bytesBuffer(objects.objects.get([...objects.objects.keys()].find((k) => k.endsWith("trades.log.parquet"))!)!))).groups;
+      for await (const g of snap) for (const e of g) expect(typeof e.row).toBe("object");
+      await plain.commit([append("B", 10)]);
+      const want2 = await reads(plain);
+      expect(await reads(bare)).toEqual(want2);
+      await bare.close();
+      const again = await openStore(opts(objects, await tmp(), withCodec(counted().codec)));
+      expect(await reads(again)).toEqual(want2);
+    });
+
+    it("a commit whose row the codec does not give back is refused before anything is written", async () => {
+      const lossy: RowCodec = { pack: (r) => `${(r as Trade).b}|${(r as Trade).i}|x`, unpack: (p) => ({ b: Number(p.split("|")[0]), i: Number(p.split("|")[1]), v: "x" }) };
+      const s = await openStore(opts(new MemoryObjectStore(), await tmp(), withCodec(lossy)));
+      await s.commit([{ t: "append", table: "trades", partition: "A", row: { b: 1, i: 0, v: "x" } }]);
+      await expect(s.commit([{ t: "put", table: "meta", key: "k", value: 1 }, append("A", 2)])).rejects.toThrow(/codec does not give back/);
+      expect([s.seq, s.stateTable("meta").has("k"), s.logTable("trades").size]).toEqual([1, false, 1]);
+    });
+
+    it("seal callbacks get decoded rows, or with `packed` the packed strings", async () => {
+      const { codec, n } = counted();
+      const s = await openStore(opts(new MemoryObjectStore(), await tmp(), withCodec(codec)));
+      await s.commit([1, 2, 3, 4, 5].map((b) => append("A", b))); // waiting: 1, 2
+      const seen: Json[] = [];
+      expect(await s.sealLogs({ where: (r) => (seen.push(r), (r as Trade).b === 1), withOps: (rows) => (seen.push(...rows.map(([, r]) => r)), []) })).toBe(1);
+      expect(seen).toEqual([{ b: 1, i: 0, v: "A1.0" }, { b: 2, i: 0, v: "A2.0" }, { b: 1, i: 0, v: "A1.0" }]);
+      seen.length = 0;
+      const before = n.unpack;
+      expect(await s.sealLogs({ packed: true, where: (r) => (seen.push(r), true), evict: (r) => (r as string).startsWith("5|"), withOps: (rows) => (seen.push(...rows.map(([, r]) => r)), []) })).toBe(2);
+      expect(seen).toEqual(["2|0|A2.0", "2|0|A2.0", "5|0|A5.0"]);
+      expect(n.unpack - before).toBe(4); // only to write the files: the 2 sealed rows, the 2 left in the snapshot
+      expect(blocks([...s.logTable<Trade>("trades").memoryRows("A")])).toEqual([3, 4]);
+      expect(blocks(await all(s.logTable<Trade>("trades").scan({ partition: "A", from: [0], to: [9] })))).toEqual([1, 2, 3, 4, 5]);
+    });
+
+    it("rows loaded on open (snapshot and WAL) that the codec does not give back are held as they are, read exactly", async () => {
+      // a codec that loses any "|" in v: no commit through it would take such a row, but stored data may hold one
+      const lossy: RowCodec = {
+        pack: (r) => `${(r as Trade).b}|${(r as Trade).i}|${(r as Trade).v}`,
+        unpack: (p) => {
+          const [b, i, v] = p.split("|");
+          return { b: Number(b), i: Number(i), v: v! };
+        },
+      };
+      const objects = new MemoryObjectStore();
+      const raw = await openStore(opts(objects, await tmp()));
+      const row = (b: number, v: string) => ({ t: "append" as const, table: "trades", partition: "A", row: { b, i: 0, v } });
+      await raw.commit([row(1, "ok"), row(2, "x|y"), row(3, "ok"), row(4, "ok")]);
+      await raw.snapshot();
+      await raw.commit([row(5, "p|q"), row(6, "ok")]); // in the WAL only
+      await raw.flush();
+      const want = await all(raw.logTable<Trade>("trades").scan({ partition: "A", from: [0], to: [9] }));
+      const s = await openStore(opts(objects, await tmp(), withCodec(lossy))); // takes the prefix over
+      const log = s.logTable<Trade>("trades");
+      expect(await all(log.scan({ partition: "A", from: [0], to: [9] }))).toEqual(want);
+      expect([...log.memoryRows("A")]).toEqual(want);
+      expect([...log.packedRowsInMemory("A")].map((r) => typeof r).sort()).toEqual(["object", "object", "string", "string", "string", "string"]);
+      // a packed seal gets those rows as they are; the seal and its snapshot keep them exact
+      const seen: Json[] = [];
+      expect(await s.sealLogs({ packed: true, where: (r) => (seen.push(r), true) })).toBe(3); // waiting: 1, 2, 3
+      expect(seen).toEqual(["1|0|ok", { b: 2, i: 0, v: "x|y" }, "3|0|ok"]);
+      expect(await all(log.scan({ partition: "A", from: [0], to: [9] }))).toEqual(want);
+      const plain = await openStore(opts(objects, await tmp())); // no codec: the stored rows are the rows
+      expect(await all(plain.logTable<Trade>("trades").scan({ partition: "A", from: [0], to: [9] }))).toEqual(want);
+    });
+
+    it("a snapshot is read back one row group at a time", async () => {
+      const objects = new MemoryObjectStore();
+      const s = await openStore(opts(objects, await tmp(), { tables: { state: ["meta"], log: [{ name: "trades", keepPerPartition: 30_000, sortKey }] } }));
+      await s.commit(Array.from({ length: 25_000 }, (_, i) => append("A", i)));
+      await s.snapshot();
+      const key = [...objects.objects.keys()].find((k) => k.endsWith("trades.log.parquet"))!;
+      const sizes: number[] = [];
+      for await (const g of (await readLogParquetGroups(bytesBuffer(objects.objects.get(key)!))).groups) sizes.push(g.length);
+      expect(sizes).toEqual([10_000, 10_000, 5_000]);
+      const again = await openStore(opts(objects, await tmp(), { tables: { state: ["meta"], log: [{ name: "trades", keepPerPartition: 30_000, sortKey }] } }));
+      expect(again.logTable("trades").size).toBe(25_000);
+    });
   });
 });

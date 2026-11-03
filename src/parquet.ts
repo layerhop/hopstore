@@ -85,7 +85,9 @@ export const readMetadata = (file: AsyncBuffer): Promise<FileMetaData> => parque
 export const readRows = (file: AsyncBuffer, metadata: FileMetaData, rowStart: number, rowEnd: number): Promise<Record<string, unknown>[]> =>
   parquetReadObjects({ file, metadata, rowStart, rowEnd });
 
-const toArrayBuffer = (b: Uint8Array) => b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer;
+/** The bytes as an ArrayBuffer: the underlying one when `b` spans it whole (no copy of a large file), else a copy. */
+const toArrayBuffer = (b: Uint8Array) =>
+  (b.byteOffset === 0 && b.byteLength === b.buffer.byteLength && b.buffer instanceof ArrayBuffer ? b.buffer : b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength)) as ArrayBuffer;
 
 /** An in-memory file. */
 export const bytesBuffer = (b: Uint8Array): AsyncBuffer => toArrayBuffer(b);

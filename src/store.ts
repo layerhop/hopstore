@@ -10,18 +10,18 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { gunzip, gzip } from "node:zlib";
 import { decodeRecords, encodeRecords, type Batch, type Json, type Op } from "./codec.js";
-import { LogTableImpl, readLogParquet, segmentBounds, writeLogParquet, type Entry, type LogSpec, type LogTable, type SegmentSource, type SortKey } from "./log-table.js";
+import { compareEntry, LogTableImpl, readLogParquetGroups, segmentBounds, writeLogParquet, type Entry, type LogSpec, type LogTable, type SegmentSource, type SortKey } from "./log-table.js";
 import { createManifest, emptyManifest, highestManifestSeq, predecessorExists, readLatestManifest, segmentKey, snapshotDir, walKey, walLastSeq, type Manifest, type SegmentRef, type SnapshotRef } from "./manifest.js";
-import { bytesBuffer, fileBuffer, objectBuffer, type AsyncBuffer } from "./parquet.js";
+import { bytesBuffer, fileBuffer, objectBuffer, readMetadata, readRows, type AsyncBuffer } from "./parquet.js";
 import type { ObjectStore } from "./s3.js";
 import { RankedIndexImpl, type RankedIndex } from "./ranked.js";
-import { readStateSnapshot, StateTableImpl, writeStateSnapshot, type StateTable } from "./state-table.js";
+import { readStateSnapshotGroups, StateTableImpl, writeStateSnapshot, type StateTable } from "./state-table.js";
 import { LocalWal, readLocalWals, removeLocalWals } from "./wal.js";
 
 export type { Batch, Json, Op } from "./codec.js";
 export type { StateTable } from "./state-table.js";
 export type { RankedIndex } from "./ranked.js";
-export { compareSort, type LogSpec, type LogTable, type SortKey } from "./log-table.js";
+export { compareSort, type LogSpec, type LogTable, type RowCodec, type SortKey } from "./log-table.js";
 
 const gzipAsync = promisify(gzip);
 const gunzipAsync = promisify(gunzip);
@@ -60,7 +60,7 @@ export interface StoreOptions {
   localDir: string;
   /** Group-commit interval (default 1000 ms). */
   flushMs?: number;
-  /** Snapshot interval (default 10 minutes). */
+  /** Snapshot interval (default 10 minutes), counted from the last snapshot: a seal (which writes one) starts it over. */
   snapshotEveryMs?: number;
   tables?: StoreTables;
   /** Segments up to this size are fetched whole and cached under `<localDir>/cache/`; larger ones are read by range (default 64 MiB). */
@@ -71,12 +71,47 @@ export interface StoreOptions {
 
 /** Which log rows `Store.sealLogs` moves to segments. */
 export interface SealOptions {
+  /** only these log tables (default: every one); the others keep their rows and their callbacks are not called */
+  tables?: string[];
   /** waiting rows: only those whose sort key is lower */
   olderThanSort?: SortKey;
-  /** waiting rows: only those it accepts */
-  where?: (row: Json) => boolean;
+  /** waiting rows: only those it accepts (`partition` and `table`: the row's) */
+  where?: (row: Json, partition: string, table: string) => boolean;
   /** any row in memory it accepts, the tail included (age-based eviction) */
-  evict?: (row: Json) => boolean;
+  evict?: (row: Json, partition: string, table: string) => boolean;
+  /**
+   * Ops to commit with the seal, built from exactly the rows it takes (`[partition, row]`, in (partition, sort)
+   * order) when it starts: they are committed before the snapshot is captured, so the seal publishes them with its
+   * segments (e.g. an index of what was sealed that must never miss a sealed row). Called again if the seal retries.
+   * Each entry also names the row's table (a callback typed for `[partition, row]` pairs still fits).
+   */
+  withOps?(sealed: [partition: string, row: Json, table?: string][]): Op[];
+  /**
+   * `where`, `evict` and `withOps` get each row as memory holds it: a table with a codec passes its packed strings, not
+   * decoded rows (a predicate that reads a field or two straight from the packed form is far cheaper than decoding),
+   * except for a row the codec did not give back when the store loaded it, which is held and passed as the row itself.
+   */
+  packed?: boolean;
+}
+
+/** Which segments of a log table `Store.compactLogs` merges. */
+export interface CompactOptions {
+  table: string;
+  /**
+   * A segment's group (its manifest bounds, rows and bytes), or null to leave it as it is: consecutive segments (in
+   * seal order) of the same group are merged into one.
+   */
+  group: (segment: { sortMin: SortKey; sortMax: SortKey; partitionMin: string; partitionMax: string; rows: number; size: number }) => string | null;
+  /** Rows per merged segment at most: a run is cut before it would exceed this (default 1,000,000). */
+  maxRows?: number;
+  /** Merged segments written by this call at most (default: all). */
+  maxRuns?: number;
+  /**
+   * false: segments of a group merge wherever they are in the seal order (the merged one takes the place of the
+   * first). Only for a table that never holds a key in two segments (or only identical rows), as order between
+   * segments then decides nothing. Default true: only consecutive segments merge.
+   */
+  consecutive?: boolean;
 }
 
 /** What `Store.describe` reports: this writer's view of the current manifest and its tables (read-only, no S3 calls). */
@@ -111,6 +146,9 @@ class UndeclaredTable extends Error {
 
 /** A recovery read raced a cleanup of the previous writer; open() starts over. */
 class RetryOpen extends Error {}
+
+/** Ranked-index changes of a batch: index name → group → member → score (null: removed), in the order of their last change. */
+type PendingRanked = Map<string, Map<string, Map<string, bigint | null>>>;
 
 /** Every table the store holds, and the one place where ops are validated and applied (live commits and replay). */
 class Tables {
@@ -165,6 +203,7 @@ class Tables {
       if (typeof op.partition !== "string") throw new Error(`partition must be a string (table ${op.table})`);
       if (op.row === undefined) throw new Error(`append without row (table ${op.table})`);
       l.sortKeyOf(op.row); // dry run, like ranked entries
+      l.checkCodec(op.row);
       return;
     }
     if (op.t !== "put" && op.t !== "del") throw new Error(`unknown op ${(op as { t: unknown }).t}`);
@@ -174,8 +213,11 @@ class Tables {
     if (op.t === "put") this.entries(op.table, op.key, op.value); // dry run: a bad value must not reach the WAL
   }
 
-  /** Applies one op. An undeclared table fails (recovery must not drop data that a later snapshot would then delete). */
-  apply(op: Op): void {
+  /**
+   * Applies one op. An undeclared table fails (recovery must not drop data that a later snapshot would then delete).
+   * With `pending`, ranked-index changes are collected there (the last change of a member wins); `applyBatch` applies them at its end.
+   */
+  apply(op: Op, pending?: PendingRanked): void {
     if (op.t === "append") {
       const l = this.log.get(op.table);
       if (!l) throw new UndeclaredTable(op.table);
@@ -189,6 +231,20 @@ class Tables {
     const next = op.t === "put" ? this.entries(op.table, op.key, op.value) : [];
     const old = t.get(op.key);
     const prev = old === undefined ? [] : this.entries(op.table, op.key, old);
+    if (pending) {
+      t.apply(op);
+      const set = (name: string, group: string, member: string, score: bigint | null) => {
+        let byGroup = pending.get(name);
+        if (!byGroup) pending.set(name, (byGroup = new Map()));
+        let m = byGroup.get(group);
+        if (!m) byGroup.set(group, (m = new Map()));
+        m.delete(member); // re-insert: the latest change is the one applied
+        m.set(member, score);
+      };
+      for (const e of prev) set(e.name, e.group, e.member, null);
+      for (const e of next) set(e.name, e.group, e.member, e.score);
+      return;
+    }
     for (const e of prev) this.ranked.get(e.name)!.apply(e.group, e.member, null);
     t.apply(op);
     for (const e of next) this.ranked.get(e.name)!.apply(e.group, e.member, e.score);
@@ -203,8 +259,14 @@ class Tables {
     });
   }
 
+  /** Applies a batch; its ranked-index changes go in one `applyMany` per group, the last change of a member only. */
   applyBatch(b: Batch): void {
-    for (const op of b.ops) this.apply(op);
+    const pending: PendingRanked = new Map();
+    try {
+      for (const op of b.ops) this.apply(op, pending);
+    } finally {
+      for (const [name, groups] of pending) for (const [group, changes] of groups) this.ranked.get(name)!.applyMany(group, changes);
+    }
   }
 }
 
@@ -305,12 +367,16 @@ async function recover(o: StoreOptions) {
   for (const name of [...Object.keys(logSnapshots), ...Object.keys(manifest.segments)]) if (!tables.log.has(name)) throw new UndeclaredTable(name);
   for (const [name, ref] of Object.entries(manifest.snapshots)) {
     const table = tables.state.get(name)!;
-    for (const [k, v] of (await readStateSnapshot(await loadSnapshot(o, ref))).rows) table.load(k, v);
+    // a row group at a time (like log snapshots below): never the whole table decoded next to the loaded rows
+    const { groups } = await readStateSnapshotGroups(bytesBuffer(await loadSnapshot(o, ref)));
+    for await (const g of groups) for (const [k, v] of g) table.load(k, v);
   }
   // unsealed log rows only: segments are never read back into memory
   for (const [name, ref] of Object.entries(logSnapshots)) {
     const table = tables.log.get(name)!;
-    for (const e of (await readLogParquet(bytesBuffer(await loadSnapshot(o, ref)))).entries) table.insert({ p: e.p, s: table.sortKeyOf(e.row), row: e.row });
+    // a row group at a time: memory never holds the whole file decoded next to the (possibly packed) rows
+    const { groups } = await readLogParquetGroups(bytesBuffer(await loadSnapshot(o, ref)));
+    for await (const g of groups) for (const e of g) table.insert({ p: e.p, s: table.sortKeyOf(e.row), row: e.row });
   }
   tables.rebuildRanked();
   let seq = manifest.snapshotSeq;
@@ -364,13 +430,19 @@ export class Store {
   private fenced: FencedError | null = null;
   private failure: Error | null = null;
   private closed = false;
+  /** compactLogs calls in flight: close() waits for them (each stops after its current run). */
+  private readonly compactions = new Set<Promise<unknown>>();
   /** close() has finished: nothing will flush any more */
   private shut = false;
   private seals: SealAttempt[] = [];
+  /** segment key → scans that may still read it (cleanup does not delete those) */
+  private readonly leased = new Map<string, number>();
   private readonly warming = new Map<string, Promise<void>>();
   /** segment files open for scans right now, and the most at once (tests) */
   private readonly segmentStats = { open: 0, maxOpen: 0 };
   private readonly timers: NodeJS.Timeout[] = [];
+  /** the next periodic snapshot; every checkpoint (snapshot or seal) starts it over */
+  private snapshotTimer: NodeJS.Timeout | null = null;
   private readonly flushMs: number;
   private readonly onError: (e: unknown) => void;
 
@@ -391,8 +463,8 @@ export class Store {
       this.timers.push(t);
     };
     every(this.flushMs, () => this.flushNow());
-    every(o.snapshotEveryMs ?? 600_000, () => this.snapshotNow());
-    const source: SegmentSource = { segments: (t) => this.manifest.segments[t] ?? [], open: (ref) => this.openSegment(ref) };
+    this.scheduleSnapshot();
+    const source: SegmentSource = { segments: (t) => this.manifest.segments[t] ?? [], open: (ref) => this.openSegment(ref), lease: (refs) => this.lease(refs) };
     for (const l of tables.log.values()) l.source = source;
   }
 
@@ -448,6 +520,14 @@ export class Store {
     return (this.fenced ?? this.failure)?.message ?? null;
   }
 
+  /**
+   * Seals that reported a failure but may still land: a later publish can adopt one, and its rows then leave memory.
+   * 0 once each has landed (adopted) or can no longer land (its manifest slot was taken).
+   */
+  sealsInDoubt(): number {
+    return this.seals.filter((a) => a.triedSeq !== undefined).length;
+  }
+
   /** Last batch seq published to S3. */
   durableSeq(): number {
     return this.manifest.batchSeq;
@@ -497,7 +577,7 @@ export class Store {
    * groups a scan needs). An uncached segment up to `segmentWholeMaxBytes` is also fetched whole in the background to
    * warm the cache (at most two at a time), never on the scan path.
    */
-  private async openSegment(ref: SegmentRef) {
+  private async openSegment(ref: SegmentRef, warm = true) {
     const stats = this.segmentStats;
     const opened = (file: AsyncBuffer, close: () => Promise<void>) => {
       stats.maxOpen = Math.max(stats.maxOpen, ++stats.open);
@@ -512,7 +592,7 @@ export class Store {
     } catch {
       // not cached
     }
-    if (ref.size <= (this.o.segmentWholeMaxBytes ?? SEGMENT_WHOLE_MAX_BYTES) && this.warming.size < 2 && !this.warming.has(ref.key) && !this.closed) {
+    if (warm && ref.size <= (this.o.segmentWholeMaxBytes ?? SEGMENT_WHOLE_MAX_BYTES) && this.warming.size < 2 && !this.warming.has(ref.key) && !this.closed) {
       const warm = (async () => {
         const body = await this.o.objects.get(ref.key);
         if (body?.byteLength === ref.size) await cacheFile(path, body);
@@ -522,6 +602,20 @@ export class Store {
       this.warming.set(ref.key, warm);
     }
     return opened(objectBuffer(this.o.objects, ref.key, ref.size), async () => {});
+  }
+
+  private lease(refs: SegmentRef[]): () => void {
+    for (const r of refs) this.leased.set(r.key, (this.leased.get(r.key) ?? 0) + 1);
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      for (const r of refs) {
+        const n = this.leased.get(r.key)! - 1;
+        if (n) this.leased.set(r.key, n);
+        else this.leased.delete(r.key);
+      }
+    };
   }
 
   /** Resolves once background cache warming has finished (tests, close). */
@@ -693,6 +787,7 @@ export class Store {
   /** Rejects everything waiting and stops the timers (fenced or the local disk failed). */
   private stop(err: Error): void {
     for (const t of this.timers) clearInterval(t);
+    if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
     if (this.flushTimer) clearTimeout(this.flushTimer);
     this.flushTimer = null;
     for (const w of this.waiters.splice(0)) w.reject(err);
@@ -712,37 +807,68 @@ export class Store {
     return this.runS3(async () => void (await this.checkpoint(null)));
   }
 
+  /** (Re)starts the periodic snapshot timer: due `snapshotEveryMs` after the last checkpoint. */
+  private scheduleSnapshot(): void {
+    if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
+    this.snapshotTimer = null;
+    if (this.closed || this.fenced || this.failure) return;
+    this.snapshotTimer = setTimeout(() => {
+      this.snapshotTimer = null;
+      void this.snapshotNow().catch((e) => this.fenced || this.onError(e));
+    }, this.o.snapshotEveryMs ?? 600_000);
+    this.snapshotTimer.unref();
+  }
+
   /**
    * Moves the rows waiting in memory (beyond each partition's `keepPerPartition`; with `olderThanSort`, only those
    * whose sort key is lower; with `where`, only those it accepts) into one sorted Parquet segment per log table. `evict`
    * also takes any row in memory it accepts, the tail included: age-based eviction (rows of a pruned day leave memory
    * even when they are among the newest of their partition). The segments are published together with a snapshot that
    * no longer holds those rows, so WAL replay can never bring them back; memory drops them only after the manifest is
-   * published. Returns the number of rows sealed. The callbacks run synchronously when the seal starts. Rejects once
-   * closed or fenced.
+   * published. Returns the number of rows sealed. The callbacks run synchronously when the seal starts. With `tables`,
+   * only those log tables are sealed. Rejects once closed or fenced, and for an undeclared table.
    */
   sealLogs(opts: SealOptions = {}): Promise<number> {
-    const bad = this.unusable();
+    const bad =
+      this.unusable() ??
+      opts.tables?.filter((n) => !this.tables.log.has(n)).map((n) => new Error(`unknown log table ${n}`))[0] ??
+      (opts.tables && new Set(opts.tables).size !== opts.tables.length ? new Error("hopstore: sealLogs names a table twice") : null);
     if (bad) return Promise.reject(bad);
     return this.runS3(() => this.checkpoint(opts));
   }
 
   /** Runs a checkpoint; starts over when an adopted manifest turned out to hold an earlier seal (memory changed under it). */
   private async checkpoint(seal: SealOptions | null): Promise<number> {
-    for (let round = 1; ; round++) {
-      const n = await this.checkpointOnce(seal);
-      if (n !== "superseded") return n;
-      if (round >= 3) throw new Error("hopstore: checkpoint superseded three times");
+    let empty = false;
+    try {
+      for (let round = 1; ; round++) {
+        const n = await this.checkpointOnce(seal);
+        if (n !== "superseded") {
+          empty = seal !== null && n === 0;
+          return n;
+        }
+        if (round >= 3) throw new Error("hopstore: checkpoint superseded three times");
+      }
+    } finally {
+      // done or failed: the next periodic snapshot is a full period away (failures retry then); a seal that found
+      // nothing wrote nothing, so the timer stays as it was
+      if (!empty) this.scheduleSnapshot();
     }
   }
 
   private async checkpointOnce(seal: SealOptions | null): Promise<number | "superseded"> {
     if (this.fenced) throw this.fenced;
     const { prefix } = this.o;
+    const sealing = seal?.tables ? seal.tables.map((n) => this.tables.log.get(n)!) : [...this.tables.log.values()];
+    const sealed = seal ? sealing.map((t) => ({ t, entries: t.sealable({ olderThan: seal.olderThanSort, where: seal.where, evict: seal.evict, packed: seal.packed }) })).filter((x) => x.entries.length) : [];
+    if (seal && !sealed.length) return 0;
+    // rows leave memory only when a manifest is published (here, on this lane), so `sealed` stays valid while the
+    // seal's own ops commit
+    const ops = seal?.withOps?.(sealed.flatMap(({ t, entries }) => entries.map((e): [string, Json, string] => [e.p, seal.packed ? e.row : t.rowOf(e), t.name]))) ?? [];
+    if (ops.length) await this.commit(ops);
     const seq = this.applied;
     // captured synchronously: the tables are exactly the state at `seq`, and the earlier seals still in doubt
-    const sealed = seal ? [...this.tables.log.values()].map((t) => ({ t, entries: t.sealable({ olderThan: seal.olderThanSort, where: seal.where, evict: seal.evict }) })).filter((x) => x.entries.length) : [];
-    if (seal ? !sealed.length : seq <= this.manifest.snapshotSeq) return 0;
+    if (!seal && seq <= this.manifest.snapshotSeq) return 0;
     const inDoubt = new Set(this.seals.flatMap((a) => [...a.keys]));
     const mseq = this.manifest.seq + 1;
     const nonce = randomUUID().slice(0, 8);
@@ -751,7 +877,7 @@ export class Store {
     // also captured now, encoded below a row group at a time while commits go on: state tables are frozen (writes go
     // to an overlay until thawed), log tables leave out rows appended after this point
     const frozen = [...this.tables.state].map(([name, t]) => ({ name, t, rows: t.freeze() }));
-    const unsealed = [...this.tables.log].map(([name, t]) => ({ name, rows: t.unsealed(), n: t.size }));
+    const unsealed = [...this.tables.log].map(([name, t]) => ({ name, t, rows: t.unsealed(), n: t.size }));
     const state: { name: string; key: string; body: Uint8Array }[] = [];
     const logs: typeof state = [];
     const segs: (typeof state[number] & { ref: SegmentRef })[] = [];
@@ -760,10 +886,10 @@ export class Store {
         state.push({ name, key: `${dir}${name}.parquet`, body: await writeStateSnapshot(name, rows, rows.size) });
         t.thaw();
       }
-      for (const { name, rows, n } of unsealed) logs.push({ name, key: `${dir}${name}.log.parquet`, body: await writeLogParquet(name, withoutSealed(rows, gone), n - gone.size) });
+      for (const { name, t, rows, n } of unsealed) logs.push({ name, key: `${dir}${name}.log.parquet`, body: await writeLogParquet(name, withoutSealed(rows, gone), n - gone.size, (e) => t.jsonOf(e)) });
       for (const { t, entries } of sealed) {
         const key = segmentKey(prefix, t.name, mseq, nonce, this.epoch);
-        const body = await writeLogParquet(t.name, entries, entries.length);
+        const body = await writeLogParquet(t.name, entries, entries.length, (e) => t.jsonOf(e));
         segs.push({ name: t.name, key, body, ref: { key, size: body.byteLength, ...segmentBounds(entries) } });
       }
     } finally {
@@ -813,6 +939,120 @@ export class Store {
   }
 
   /**
+   * Merges consecutive segments of a log table that `group` puts in the same group into one sorted segment each (a run
+   * at most `maxRows` rows): fewer segments for scans to consider and for the manifest to carry. Each merged segment is
+   * published in a manifest that names it in place of its inputs, at their position, so every scan returns the same
+   * rows in the same order (equal keys stay oldest first: inputs in seal order, each in its own order). A crash before
+   * that manifest leaves the inputs in use and the new object an orphan (a later cleanup deletes it); inputs are
+   * deleted only by a cleanup after the publish, and not while a scan that started before it still runs. Each merge
+   * takes the S3 lane only to publish (reading and writing happen off it), and the final cleanup is a lane task of its
+   * own, so WAL flushes publish between them. Returns how many segments fewer the table has. Rejects once closed or
+   * fenced, and for an undeclared table.
+   */
+  compactLogs(o: CompactOptions): Promise<number> {
+    const bad = this.unusable() ?? (this.tables.log.has(o.table) ? null : new Error(`unknown log table ${o.table}`));
+    if (bad) return Promise.reject(bad);
+    const run = (async () => {
+      let fewer = 0;
+      for (let runs = 0; runs < (o.maxRuns ?? Number.POSITIVE_INFINITY); runs++) {
+        const stop = this.unusable();
+        if (stop) throw stop;
+        const run = this.nextRun(o);
+        if (!run) break;
+        if (await this.compactRun(o.table, run)) fewer += run.length - 1;
+      }
+      if (fewer) await this.runS3(() => this.cleanup());
+      return fewer;
+    })();
+    this.compactions.add(run);
+    void run.catch(() => {}).finally(() => this.compactions.delete(run));
+    return run;
+  }
+
+  /**
+   * The first run of at least two segments of one group within `maxRows` (consecutive ones unless `consecutive` is
+   * false), in seal order, or null.
+   */
+  private nextRun(o: CompactOptions): SegmentRef[] | null {
+    const max = o.maxRows ?? 1_000_000;
+    const open = new Map<string, { run: SegmentRef[]; rows: number }>(); // runs being built, by group
+    for (const ref of this.manifest.segments[o.table] ?? []) {
+      const g = o.group({ sortMin: JSON.parse(ref.sortMin) as SortKey, sortMax: JSON.parse(ref.sortMax) as SortKey, partitionMin: ref.partitionMin, partitionMax: ref.partitionMax, rows: ref.rows, size: ref.size });
+      if (o.consecutive !== false)
+        for (const [k, r] of open)
+          if (k !== g) {
+            if (r.run.length > 1) return r.run;
+            open.delete(k);
+          }
+      if (g === null) continue;
+      const r = open.get(g);
+      if (r && r.rows + ref.rows <= max) {
+        r.run.push(ref);
+        r.rows += ref.rows;
+        continue;
+      }
+      if (r && r.run.length > 1) return r.run;
+      open.set(g, { run: [ref], rows: ref.rows });
+    }
+    for (const r of open.values()) if (r.run.length > 1) return r.run;
+    return null;
+  }
+
+  /**
+   * Reads the run's rows (kept as their stored JSON), merges them stably in (partition, sort) order and uploads the
+   * merged segment, all off the S3 lane (WAL flushes publish meanwhile), then takes the lane only to publish it. The
+   * inputs and the new object are leased throughout: no cleanup deletes them while the merge runs. False when the run
+   * was no longer there to replace (another compaction took it).
+   */
+  private async compactRun(table: string, run: SegmentRef[]): Promise<boolean> {
+    const key = segmentKey(this.o.prefix, table, this.manifest.seq + 1, randomUUID().slice(0, 8), this.epoch);
+    const release = this.lease([...run, { key } as SegmentRef]);
+    try {
+      const ref = await this.mergeRun(table, run, key);
+      const keys = new Set(run.map((r) => r.key));
+      let replaced = false;
+      await this.runS3(async () => {
+        if (this.fenced) throw this.fenced;
+        await this.publish((m) => {
+          const list = m.segments[table] ?? [];
+          if (list.filter((r) => keys.has(r.key)).length !== keys.size) return null; // published (or no longer there)
+          replaced = true;
+          const at = list.findIndex((r) => keys.has(r.key));
+          const rest = list.filter((r) => !keys.has(r.key));
+          return { ...m, segments: { ...m.segments, [table]: [...rest.slice(0, at), ref, ...rest.slice(at)] } };
+        });
+      });
+      return replaced;
+    } finally {
+      release();
+    }
+  }
+
+  /** The merged segment of a run, uploaded to `key` (and cached locally). */
+  private async mergeRun(table: string, run: SegmentRef[], key: string): Promise<SegmentRef> {
+    const entries: Entry[] = [];
+    for (const ref of run) {
+      const { file, close } = await this.openSegment(ref, false); // read once, then retired: not worth caching
+      try {
+        const meta = await readMetadata(file);
+        let start = 0;
+        for (const g of meta.row_groups) {
+          const n = Number(g.num_rows);
+          for (const r of await readRows(file, meta, start, start + n)) entries.push({ p: String(r.partition), s: JSON.parse(String(r.sort)) as SortKey, row: String(r.row) });
+          start += n;
+        }
+      } finally {
+        await close();
+      }
+    }
+    entries.sort(compareEntry); // stable: equal keys keep the inputs' order
+    const body = await writeLogParquet(table, entries, entries.length, (e) => e.row as string);
+    await this.o.objects.put(key, body, { contentType: "application/vnd.apache.parquet" });
+    await cacheFile(cachePath(this.o, key), body);
+    return { key, size: body.byteLength, ...segmentBounds(entries) };
+  }
+
+  /**
    * Deletes objects the current manifest no longer needs. Only objects of our epoch or older: a newer writer's fresh
    * uploads (not yet in any manifest) must survive.
    */
@@ -825,7 +1065,7 @@ export class Store {
     const live = new Set([...this.manifest.wal, ...snaps.map((r) => r.key), ...segs.map((r) => r.key)]);
     const doomed: string[] = [];
     for (const sub of ["wal/", "snap/", "seg/"]) {
-      for (const { key } of await this.o.objects.list(prefix + sub)) if (!live.has(key) && epochOfKey(key) <= this.epoch) doomed.push(key);
+      for (const { key } of await this.o.objects.list(prefix + sub)) if (!live.has(key) && !this.leased.has(key) && epochOfKey(key) <= this.epoch) doomed.push(key);
     }
     for (const { key } of await this.o.objects.list(`${prefix}manifest/`)) {
       const n = Number(/(\d{20})\.json$/.exec(key)?.[1]);
@@ -837,18 +1077,20 @@ export class Store {
     const keep = new Set(snaps.map(({ key: k }) => k.slice(`${prefix}snap/`.length).split("/")[0]));
     for (const d of await readdir(cacheSnap).catch(() => [] as string[])) if (!keep.has(d)) await rm(join(cacheSnap, d), { recursive: true, force: true });
     // local segment cache: drop files of segments the manifest no longer names (and stray temp files)
-    const cachedSegs = new Set(segs.map((r) => cachePath(this.o, r.key)));
+    const cachedSegs = new Set([...segs.map((r) => r.key), ...this.leased.keys()].map((k) => cachePath(this.o, k)));
     const cacheSeg = join(this.o.localDir, "cache", "seg");
     for (const t of await readdir(cacheSeg).catch(() => [] as string[])) {
       for (const f of await readdir(join(cacheSeg, t)).catch(() => [] as string[])) if (!cachedSegs.has(join(cacheSeg, t, f))) await rm(join(cacheSeg, t, f), { force: true });
     }
   }
 
-  /** Flushes and snapshots (unless fenced), stops the timers and closes the local WAL. */
+  /** Waits for compactions in flight, flushes and snapshots (unless fenced), stops the timers and closes the local WAL. */
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     for (const t of this.timers) clearInterval(t);
+    if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
+    await Promise.allSettled([...this.compactions]); // each stops after its current run (closed)
     this.localLane = this.localLane.then(() => this.writeLocal());
     await this.localLane;
     try {

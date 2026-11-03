@@ -286,7 +286,7 @@ export class S3ObjectStore implements ObjectStore {
       } catch (e) {
         throw new Error(`S3 LIST ${prefix}: malformed ListObjectsV2 response: ${e instanceof Error ? e.message : String(e)}`);
       }
-      out.push(...page.objects);
+      for (const o of page.objects) out.push(o); // never spread a data-sized array into arguments (call stack)
       if (page.truncated && !page.nextToken) throw new Error(`S3 LIST ${prefix}: truncated listing without NextContinuationToken`);
       token = page.truncated ? page.nextToken : undefined;
     } while (token);

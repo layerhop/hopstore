@@ -46,6 +46,12 @@ describe("public API", () => {
         // @ts-expect-error not part of the public type
         l.sortKeyOf(1);
         // @ts-expect-error not part of the public type
+        l.rowOf({ p: "p", s: [1], row: 1 });
+        // @ts-expect-error not part of the public type
+        l.jsonOf({ p: "p", s: [1], row: 1 });
+        // @ts-expect-error not part of the public type
+        l.checkCodec(1);
+        // @ts-expect-error not part of the public type
         l.unsealed();
         // @ts-expect-error not part of the public type
         l.sealable();

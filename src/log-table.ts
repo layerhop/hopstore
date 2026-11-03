@@ -2,6 +2,8 @@
  * Log tables: append-only rows per partition, ordered by a sort key. Memory holds the newest `keepPerPartition` rows of
  * each partition (the tail) plus older rows waiting to be sealed; `Store.sealLogs` moves those (and, with `evict`, tail
  * rows that have aged out, e.g. of a pruned day) into a sorted Parquet segment on S3. Snapshots carry every unsealed row, so recovery never reads segments.
+ * A table with a `codec` holds each row in memory as one packed string and decodes it on every read; the WAL, snapshots
+ * and segments always hold the rows themselves.
  */
 import { deepFreeze, type Json, type Op } from "./codec.js";
 import type { SegmentRef } from "./manifest.js";
@@ -9,18 +11,34 @@ import { kvMetadata, readMetadata, readRows, ROW_GROUP_SIZE, writeParquetRows, t
 
 export type SortKey = (string | number)[];
 
+/**
+ * How a log table holds its rows in memory: `pack` turns a row into one string (e.g. a compact binary encoding, much
+ * smaller than an array of strings and numbers), `unpack` gives the row back. `unpack(pack(row))` must equal `row` as
+ * JSON for every row the table takes (a commit checks it and refuses the batch otherwise).
+ */
+export interface RowCodec {
+  pack(row: Json): string;
+  unpack(packed: string): Json;
+}
+
 /** A declared log table. */
 export interface LogSpec {
   name: string;
   /** Rows per partition that stay in memory for `latest` (older rows wait in memory until sealed). */
   keepPerPartition: number;
   sortKey: (row: Json) => SortKey;
+  /**
+   * Holds rows in memory packed (see RowCodec): reads return a decoded copy. Only memory changes, so a codec can be
+   * added, changed or removed on an existing store.
+   */
+  codec?: RowCodec;
 }
 
 /** A row with its partition and sort key (internal to the package). */
 export interface Entry {
   p: string;
   s: SortKey;
+  /** the row; in memory, for a table with a codec, its packed string (unless the codec could not give it back) */
   row: Json;
   /** insertion stamp (set by `LogTable.insert`): a snapshot leaves out rows stamped after its capture */
   n?: number;
@@ -71,6 +89,8 @@ function mergeSorted(a: Entry[], b: Entry[]): Entry[] {
 }
 
 interface Partition {
+  /** the partition: every row in memory shares this one string */
+  name: string;
   /** newest rows, ascending, at most keepPerPartition */
   tail: Entry[];
   /** older rows waiting for sealLogs, ascending */
@@ -80,6 +100,8 @@ interface Partition {
 /** How a log table reaches its segments; the store wires it up. */
 export interface SegmentSource {
   segments(table: string): SegmentRef[];
+  /** Marks these segments in use by a scan until the returned function is called (cleanup keeps them meanwhile). */
+  lease?(refs: SegmentRef[]): () => void;
   /** A readable file for a segment (cached locally or read by range) and a function that releases it. */
   open(ref: SegmentRef): Promise<{ file: AsyncBuffer; close: () => Promise<void> }>;
 }
@@ -89,11 +111,27 @@ const noSegments: SegmentSource = {
   open: () => Promise.reject(new Error("hopstore: no segment source")),
 };
 
-/** Which rows a seal takes (see `LogTable.sealable`, `Store.sealLogs`). */
+/**
+ * Which rows a seal takes (see `LogTable.sealable`, `Store.sealLogs`); the callbacks also get the row's partition and
+ * table, and with `packed` a table's packed strings instead of decoded rows.
+ */
 export interface SealSelect {
   olderThan?: SortKey;
-  where?: (row: Json) => boolean;
-  evict?: (row: Json) => boolean;
+  where?: (row: Json, partition: string, table: string) => boolean;
+  evict?: (row: Json, partition: string, table: string) => boolean;
+  packed?: boolean;
+}
+
+/** First index in `list` (ascending) whose sort key is >= `s`. */
+function lowerBound(list: Entry[], s: SortKey): number {
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (compareSort(list[mid]!.s, s) < 0) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
 }
 
 /** Read-only view of a log table (what `Store.logTable` returns). Appends go through `Store.commit` (`{ t: "append", table, partition, row }`). */
@@ -111,8 +149,15 @@ export interface LogTable<R extends Json = Json> {
   has(partition: string, sortKey: SortKey): boolean;
   /** Rows with `from <= sortKey < to`, of one partition or all, in (partition, sortKey) order: memory merged with the segments. */
   scan(range: { partition?: string; from: SortKey; to: SortKey }): AsyncIterable<R>;
-  /** Every row of a partition held in memory, in no particular order and without copying. Do not commit to the table while iterating. */
+  /** `scan`, each row with its partition. */
+  scanEntries(range: { partition?: string; from: SortKey; to: SortKey }): AsyncIterable<[partition: string, row: R]>;
+  /** Every row of a partition held in memory, in no particular order and without copying the list. Do not commit to the table while iterating. */
   rowsInMemory(partition: string): IterableIterator<R>;
+  /**
+   * `rowsInMemory` as held: each row's packed string for a table with a codec (no decoding), else the rows. A row the
+   * codec could not give back when it was loaded is held, and yielded, as the row itself.
+   */
+  packedRowsInMemory(partition: string): IterableIterator<Json>;
 }
 
 /** The log table itself, internal to the package: the store appends, snapshots and seals through it. */
@@ -121,8 +166,36 @@ export class LogTableImpl<R extends Json = Json> implements LogTable<R> {
   source: SegmentSource = noSegments;
   private rows = 0;
   private stamp = 0;
+  private readonly codec: RowCodec | undefined;
+  /** Entries of a codec table holding the row itself: the codec did not give it back (null until there is one). */
+  private unpacked: WeakSet<Entry> | null = null;
 
-  constructor(readonly spec: LogSpec) {}
+  constructor(readonly spec: LogSpec) {
+    this.codec = spec.codec;
+  }
+
+  /** The row of an entry held in memory (decoded for a table with a codec). */
+  rowOf(e: Entry): Json {
+    return this.codec && !this.unpacked?.has(e) ? this.codec.unpack(e.row as string) : e.row;
+  }
+
+  /** The JSON text of an entry held in memory: what snapshots and segments store. */
+  jsonOf(e: Entry): string {
+    return JSON.stringify(this.rowOf(e));
+  }
+
+  /** The row packed, or null when the codec does not give it back exactly. */
+  private pack(row: Json): string | null {
+    const packed = this.codec!.pack(row);
+    return JSON.stringify(this.codec!.unpack(packed)) === JSON.stringify(row) ? packed : null;
+  }
+
+  /** Throws unless the codec gives back exactly this row (as the WAL holds it: decoded from its JSON). */
+  checkCodec(row: Json): void {
+    if (!this.codec) return;
+    const json = JSON.stringify(row);
+    if (JSON.stringify(this.codec.unpack(this.codec.pack(JSON.parse(json) as Json))) !== json) throw new Error(`log table ${this.name}: codec does not give back the row ${json}`);
+  }
 
   get name(): string {
     return this.spec.name;
@@ -138,7 +211,7 @@ export class LogTableImpl<R extends Json = Json> implements LogTable<R> {
     const tail = this.parts.get(partition)?.tail ?? [];
     const out: R[] = [];
     for (let i = tail.length - 1; i >= 0 && out.length < n; i--) {
-      const row = tail[i]!.row as R;
+      const row = this.rowOf(tail[i]!) as R;
       if (!keep || keep(row)) out.push(row);
     }
     return out;
@@ -153,7 +226,7 @@ export class LogTableImpl<R extends Json = Json> implements LogTable<R> {
   *memoryRows(partition: string): IterableIterator<R> {
     const part = this.parts.get(partition);
     if (!part) return;
-    for (const e of mergeSorted(part.pending, part.tail)) yield e.row as R;
+    for (const e of mergeSorted(part.pending, part.tail)) yield this.rowOf(e) as R;
   }
 
   /** Whether memory (tail or waiting rows, not sealed segments) holds a row of `partition` with exactly this sort key. */
@@ -161,14 +234,8 @@ export class LogTableImpl<R extends Json = Json> implements LogTable<R> {
     const part = this.parts.get(partition);
     if (!part) return false;
     for (const list of [part.tail, part.pending]) {
-      let lo = 0;
-      let hi = list.length;
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (compareSort(list[mid]!.s, sortKey) < 0) lo = mid + 1;
-        else hi = mid;
-      }
-      if (lo < list.length && compareSort(list[lo]!.s, sortKey) === 0) return true;
+      const at = lowerBound(list, sortKey);
+      if (at < list.length && compareSort(list[at]!.s, sortKey) === 0) return true;
     }
     return false;
   }
@@ -183,14 +250,30 @@ export class LogTableImpl<R extends Json = Json> implements LogTable<R> {
    * Equal keys come out oldest first: segments in seal order, then memory.
    */
   async *scan(range: { partition?: string; from: SortKey; to: SortKey }): AsyncIterable<R> {
+    for await (const e of this.scanAll(range)) yield e.row as R;
+  }
+
+  /** `scan`, each row with its partition. */
+  async *scanEntries(range: { partition?: string; from: SortKey; to: SortKey }): AsyncIterable<[partition: string, row: R]> {
+    for await (const e of this.scanAll(range)) yield [e.p, e.row as R];
+  }
+
+  /** Captured memory entries, their rows decoded (one at a time, as the merge reaches them). */
+  private async *memoryStream(list: Entry[]): AsyncGenerator<Entry> {
+    if (!this.codec) return yield* list;
+    for (const e of list) yield { p: e.p, s: e.s, row: this.rowOf(e) };
+  }
+
+  private async *scanAll(range: { partition?: string; from: SortKey; to: SortKey }): AsyncGenerator<Entry> {
     const { partition, from, to } = range;
     if (compareSort(from, to) >= 0) return;
-    const inRange = (s: SortKey) => compareSort(s, from) >= 0 && compareSort(s, to) < 0;
     const names = partition === undefined ? [...this.parts.keys()].sort(cmpStr) : this.parts.has(partition) ? [partition] : [];
     const memory: Entry[] = [];
+    // each list is ascending: only the slice inside the range is merged (a narrow range copies little of a large memory)
+    const slice = (list: Entry[]) => list.slice(lowerBound(list, from), lowerBound(list, to));
     for (const name of names) {
       const part = this.parts.get(name)!;
-      for (const e of mergeSorted(part.pending, part.tail)) if (inRange(e.s)) memory.push(e);
+      for (const e of mergeSorted(slice(part.pending), slice(part.tail))) memory.push(e);
     }
     // a segment's rows (of `partition`, if given) are >= (partition ?? partitionMin, sortMin)
     const todo = this.source
@@ -204,13 +287,15 @@ export class LogTableImpl<R extends Json = Json> implements LogTable<R> {
       rank: number;
     }
     const live: Stream[] = [];
+    // captured with `todo`: a compaction may retire these segments, but none is deleted while this scan runs
+    const release = this.source.lease?.(todo.map((x) => x.ref)) ?? (() => {});
     const add = async (it: AsyncIterator<Entry>, rank: number) => {
       const h = await it.next();
       if (!h.done) live.push({ it, head: h.value, rank });
     };
     const min = () => live.reduce<Stream | undefined>((m, x) => (!m || (compareEntry(x.head, m.head) || x.rank - m.rank) < 0 ? x : m), undefined);
     try {
-      await add(arrayStream(memory), Number.POSITIVE_INFINITY); // memory loses ties: its rows are the newest
+      await add(this.memoryStream(memory), Number.POSITIVE_INFINITY); // memory loses ties: its rows are the newest
       for (;;) {
         let best = min();
         // open every segment that may hold a row at or before the current minimum
@@ -230,13 +315,14 @@ export class LogTableImpl<R extends Json = Json> implements LogTable<R> {
           todo.splice(at, 0, next);
         }
         if (!best) return;
-        yield best.head.row as R;
+        yield best.head;
         const n = await best.it.next();
         if (n.done) live.splice(live.indexOf(best), 1);
         else best.head = n.value;
       }
     } finally {
       await Promise.all(live.map((x) => x.it.return?.()));
+      release();
     }
   }
 
@@ -255,12 +341,17 @@ export class LogTableImpl<R extends Json = Json> implements LogTable<R> {
     this.insert({ p: op.partition, s: this.sortKeyOf(op.row), row: op.row });
   }
 
-  /** Adds a row (stamped for `unsealed`; the row is frozen, see `deepFreeze`). */
-  insert(e: Entry): void {
-    deepFreeze(e.row);
-    e.n = ++this.stamp;
-    let part = this.parts.get(e.p);
-    if (!part) this.parts.set(e.p, (part = { tail: [], pending: [] }));
+  /**
+   * Adds a row (stamped for `unsealed`): packed by the codec when it gives the row back exactly (checked here too, as
+   * recovery loads rows no commit validated), else frozen and held as it is (see `deepFreeze`).
+   */
+  insert(x: Entry): void {
+    let part = this.parts.get(x.p);
+    if (!part) this.parts.set(x.p, (part = { name: x.p, tail: [], pending: [] }));
+    // a new entry of one shape: every row of a partition shares its name (each decoded op brings its own copy)
+    const packed = this.codec ? this.pack(x.row) : null;
+    const e: Entry = { p: part.name, s: x.s, row: packed ?? deepFreeze(x.row), n: ++this.stamp };
+    if (this.codec && packed === null) (this.unpacked ??= new WeakSet()).add(e);
     insertSorted(part.tail, e);
     if (part.tail.length > this.spec.keepPerPartition) insertSorted(part.pending, part.tail.shift()!);
     this.rows++;
@@ -284,22 +375,33 @@ export class LogTableImpl<R extends Json = Json> implements LogTable<R> {
   }
 
   /**
-   * Every row of a partition held in memory, in no particular order and without copying (waiting rows, then the tail).
-   * Do not commit to the table while iterating.
+   * Every row of a partition held in memory, in no particular order and without copying the list (waiting rows, then
+   * the tail). Do not commit to the table while iterating.
    */
   *rowsInMemory(partition: string): IterableIterator<R> {
+    for (const e of this.entriesInMemory(partition)) yield this.rowOf(e) as R;
+  }
+
+  /** `rowsInMemory` as held: each row's packed string for a table with a codec (no decoding), else the rows. */
+  *packedRowsInMemory(partition: string): IterableIterator<Json> {
+    for (const e of this.entriesInMemory(partition)) yield e.row;
+  }
+
+  private *entriesInMemory(partition: string): IterableIterator<Entry> {
     const part = this.parts.get(partition);
     if (!part) return;
-    for (const e of part.pending) yield e.row as R;
-    for (const e of part.tail) yield e.row as R;
+    yield* part.pending;
+    yield* part.tail;
   }
 
   /**
    * What a seal takes, in (partition, sort) order: waiting rows with sortKey < `olderThan` that `where`
-   * accepts (each test skipped when omitted), plus any row in memory, the tail included, that `evict` accepts.
+   * accepts (each test skipped when omitted), plus any row in memory, the tail included, that `evict` accepts. The
+   * callbacks get decoded rows, or with `packed` the rows as held (no decoding).
    */
   sealable(o: SealSelect = {}): Entry[] {
     const { olderThan, where, evict } = o;
+    const row = o.packed ? (e: Entry) => e.row : (e: Entry) => this.rowOf(e);
     const out: Entry[] = [];
     for (const name of [...this.parts.keys()].sort(cmpStr)) {
       const part = this.parts.get(name)!;
@@ -307,9 +409,9 @@ export class LogTableImpl<R extends Json = Json> implements LogTable<R> {
       for (const e of part.pending) {
         const old = !olderThan || compareSort(e.s, olderThan) < 0;
         if (!old && !evict) break; // ascending: nothing further is older
-        if ((old && (!where || where(e.row))) || evict?.(e.row)) waiting.push(e);
+        if ((old && (!where || where(row(e), name, this.name))) || evict?.(row(e), name, this.name)) waiting.push(e);
       }
-      const tail = evict ? part.tail.filter((e) => evict(e.row)) : [];
+      const tail = evict ? part.tail.filter((e) => evict(row(e), name, this.name)) : [];
       for (const e of tail.length ? mergeSorted(waiting, tail) : waiting) out.push(e);
     }
     return out;
@@ -330,19 +432,16 @@ export class LogTableImpl<R extends Json = Json> implements LogTable<R> {
   }
 }
 
-async function* arrayStream(list: Entry[]): AsyncGenerator<Entry> {
-  yield* list;
-}
-
 /** Row-group bounds kept in `hopstore.rowGroups`: [firstPartition, firstSort, lastPartition, lastSort] per group. */
 type GroupBounds = [string, SortKey, string, SortKey];
 
 /**
  * Writes rows sorted by (partition, sort) as Parquet: `partition`, `sort` (JSON array), `row` (JSON), row groups of
  * 10,000, metadata `hopstore.table` and the row-group bounds. Used for segments and for log snapshots; encoded a row
- * group at a time (see `writeParquetRows`).
+ * group at a time (see `writeParquetRows`). `json` gives a row's JSON text (`LogTableImpl.jsonOf` for entries held in
+ * memory).
  */
-export function writeLogParquet(table: string, entries: Iterable<Entry>, expectedRows?: number): Promise<Uint8Array> {
+export function writeLogParquet(table: string, entries: Iterable<Entry>, expectedRows?: number, json: (e: Entry) => string = (e) => JSON.stringify(e.row)): Promise<Uint8Array> {
   const groups: GroupBounds[] = [];
   let i = 0;
   const rows = function* () {
@@ -354,7 +453,7 @@ export function writeLogParquet(table: string, entries: Iterable<Entry>, expecte
       g[3] = e.s;
       row[0] = e.p;
       row[1] = JSON.stringify(e.s);
-      row[2] = JSON.stringify(e.row);
+      row[2] = json(e);
       yield row;
     }
   };
@@ -385,10 +484,26 @@ const toEntry = (r: Record<string, unknown>): Entry => ({ p: String(r.partition)
 
 /** Every row of a log snapshot (or segment) file. */
 export async function readLogParquet(file: AsyncBuffer): Promise<{ table: string; entries: Entry[] }> {
+  const { table, groups } = await readLogParquetGroups(file);
+  const entries: Entry[] = [];
+  for await (const g of groups) for (const e of g) entries.push(e);
+  return { table, entries };
+}
+
+/** The rows of a log snapshot (or segment) file one row group at a time, so a large file is never decoded at once. */
+export async function readLogParquetGroups(file: AsyncBuffer): Promise<{ table: string; groups: AsyncIterable<Entry[]> }> {
   const meta = await readMetadata(file);
   const table = kvMetadata(meta)["hopstore.table"];
   if (!table) throw new Error("log parquet without hopstore.table");
-  return { table, entries: (await readRows(file, meta, 0, Number(meta.num_rows))).map(toEntry) };
+  const groups = async function* () {
+    let start = 0;
+    for (const g of meta.row_groups) {
+      const n = Number(g.num_rows);
+      yield (await readRows(file, meta, start, start + n)).map(toEntry);
+      start += n;
+    }
+  };
+  return { table, groups: groups() };
 }
 
 const groupBounds = (meta: FileMetaData) => JSON.parse(kvMetadata(meta)["hopstore.rowGroups"] ?? "null") as GroupBounds[] | null;

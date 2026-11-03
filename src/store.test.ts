@@ -114,6 +114,33 @@ describe("Store", () => {
     expect([r.count("A"), r.count("B"), r.sum("A")]).toEqual([1, 0, 3n]);
   });
 
+  it("ranked: a bulk batch (put, del and group moves of the same keys inside it) equals one op per batch, live, after WAL replay and after reopen", async () => {
+    const objects = new MemoryObjectStore();
+    const ranked = [{ name: "by", table: "balances", group: (_k: string, v: unknown) => (v as { g: string }).g, member: (k: string) => k, score: (v: unknown) => BigInt((v as { amount: string }).amount) }];
+    const tables = { state: ["balances"], ranked };
+    let seed = 11;
+    const rnd = (n: number) => ((seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648), seed % n);
+    const ops: Parameters<Store["commit"]>[0] = [];
+    for (let i = 0; i < 600; i++) {
+      const key = `k${rnd(150)}`;
+      ops.push(rnd(6) === 0 ? { t: "del", table: "balances", key } : { t: "put", table: "balances", key, value: { g: `g${rnd(3)}`, amount: String(rnd(40) - 5) } });
+    }
+    const dir = await tmp();
+    const bulk = await Store.open(opts(objects, dir, { tables, flushMs: 1_000_000 }));
+    await bulk.commit(ops); // one batch: applyMany per group
+    const one = await openStore(opts(new MemoryObjectStore(), await tmp(), { tables }));
+    for (const op of ops) await one.commit([op]); // one op per batch: apply per member
+    const view = (s: Store) => ["g0", "g1", "g2"].map((g) => ({ top: s.ranked("by").top(g, 1_000), count: s.ranked("by").count(g), sum: s.ranked("by").sum(g) }));
+    const want = view(one);
+    expect(view(bulk)).toEqual(want);
+    const replayed = await openStore(opts(objects, dir, { tables })); // no close: the batch comes back from the local WAL
+    expect(view(replayed)).toEqual(want);
+    await replayed.snapshot();
+    await replayed.close();
+    const reopened = await openStore(opts(objects, await tmp(), { tables })); // from the S3 snapshot: rebuilt by load
+    expect(view(reopened)).toEqual(want);
+  });
+
   it("ranked minScore: the default leaves out zero and negative scores; null ranks them, also after reopen", async () => {
     const objects = new MemoryObjectStore();
     const spec = (name: string, minScore?: bigint | null) => ({ name, table: "balances", group: () => "g", member: (k: string) => k, score: (v: unknown) => BigInt(v as string), ...(minScore === undefined ? {} : { minScore }) });
@@ -193,6 +220,45 @@ describe("Store", () => {
     expect(s.durableSeq()).toBe(seq);
     const s2 = await openStore(opts(objects, await tmp()));
     expect(s2.stateTable("balances").get("a")).toEqual({ amount: "5" });
+  });
+
+  it("a seal counts as the periodic snapshot: the timer starts over after it", async () => {
+    const objects = new MemoryObjectStore();
+    const s = await openStore(opts(objects, await tmp(), { snapshotEveryMs: 1_500, tables: { state: ["meta"], log: [{ name: "ev", keepPerPartition: 0, sortKey: (r) => [r as number] }] } }));
+    await new Promise((r) => setTimeout(r, 300));
+    await s.commit([{ t: "append", table: "ev", partition: "p", row: 1 }]);
+    await s.sealLogs();
+    const sealedAt = s.describe().snapshotSeq;
+    expect(sealedAt).toBe(1);
+    await s.commit([{ t: "put", table: "meta", key: "k", value: 1 }]);
+    await new Promise((r) => setTimeout(r, 1_300)); // past the first period (1,500 ms after open), not 1,500 ms after the seal
+    expect(s.describe().snapshotSeq).toBe(sealedAt);
+    await vi.waitFor(() => expect(s.describe().snapshotSeq).toBe(2), { timeout: 3_000 });
+  });
+
+  it("a seal with nothing to seal writes no snapshot and leaves the periodic timer as it was", async () => {
+    // a fake clock for the snapshot timer only (setImmediate, setInterval and the disk stay real)
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const objects = new MemoryObjectStore();
+      const s = await openStore(opts(objects, await tmp(), { snapshotEveryMs: 1_500, tables: { state: ["meta"], log: [{ name: "ev", keepPerPartition: 5, sortKey: (r) => [r as number] }] } }));
+      await s.commit([{ t: "put", table: "meta", key: "k", value: 1 }, { t: "append", table: "ev", partition: "p", row: 1 }]);
+      vi.advanceTimersByTime(900);
+      expect(await s.sealLogs()).toBe(0); // the row is in the tail: nothing waits
+      expect(s.describe().snapshotSeq).toBe(0);
+      const settle = async () => {
+        for (let i = 0; i < 200 && s.describe().snapshotSeq === 0; i++) await new Promise((r) => setImmediate(r));
+      };
+      vi.advanceTimersByTime(599);
+      await settle();
+      expect(s.describe().snapshotSeq).toBe(0);
+      // due 1,500 ms after open, not 1,500 ms after the empty seal
+      vi.advanceTimersByTime(1);
+      await settle();
+      expect(s.describe().snapshotSeq).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("snapshot truncates wal", async () => {

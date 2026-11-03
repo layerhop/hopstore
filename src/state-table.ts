@@ -1,6 +1,6 @@
 /** State tables: latest JSON value per key, fully in memory, snapshotted as Parquet (`key`, `value` JSON text). */
 import { deepFreeze, type Json, type Op } from "./codec.js";
-import { readParquet, writeParquetRows } from "./parquet.js";
+import { bytesBuffer, kvMetadata, readMetadata, readRows, writeParquetRows, type AsyncBuffer } from "./parquet.js";
 
 const DELETED = Symbol("deleted");
 
@@ -133,9 +133,30 @@ export function writeStateSnapshot(table: string, rows: Iterable<[string, Json]>
   );
 }
 
-export async function readStateSnapshot(buf: Uint8Array): Promise<{ table: string; rows: [string, Json][] }> {
-  const { rows, metadata } = await readParquet(buf);
-  const table = metadata["hopstore.table"];
+/**
+ * A state snapshot's rows one row group (ROW_GROUP_SIZE rows) at a time: opening a store loads a large table without
+ * decoding the whole file at once, so peak memory stays close to the table itself rather than a multiple of it.
+ */
+export async function readStateSnapshotGroups(file: AsyncBuffer): Promise<{ table: string; groups: AsyncIterable<[string, Json][]> }> {
+  const meta = await readMetadata(file);
+  const table = kvMetadata(meta)["hopstore.table"];
   if (!table) throw new Error("state snapshot without hopstore.table");
-  return { table, rows: rows.map((r) => [String(r.key), JSON.parse(String(r.value)) as Json]) };
+  const groups = async function* () {
+    let start = 0;
+    for (const g of meta.row_groups) {
+      const n = Number(g.num_rows);
+      const rows = await readRows(file, meta, start, start + n);
+      yield rows.map((r): [string, Json] => [String(r.key), JSON.parse(String(r.value)) as Json]);
+      start += n;
+    }
+  };
+  return { table, groups: groups() };
+}
+
+/** Every row of a state snapshot (small files and tests; the store loads by row group, see readStateSnapshotGroups). */
+export async function readStateSnapshot(buf: Uint8Array): Promise<{ table: string; rows: [string, Json][] }> {
+  const { table, groups } = await readStateSnapshotGroups(bytesBuffer(buf));
+  const rows: [string, Json][] = [];
+  for await (const g of groups) for (const r of g) rows.push(r);
+  return { table, rows };
 }

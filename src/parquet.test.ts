@@ -1,10 +1,26 @@
 import { parquetMetadata, parquetReadObjects } from "hyparquet";
 import { parquetWriteBuffer } from "hyparquet-writer";
 import { describe, expect, it } from "vitest";
-import { ROW_GROUP_SIZE, writeParquetRows } from "./parquet.js";
-import { readStateSnapshot, writeStateSnapshot } from "./state-table.js";
+import { ROW_GROUP_SIZE, bytesBuffer, writeParquetRows } from "./parquet.js";
+import { readStateSnapshot, readStateSnapshotGroups, writeStateSnapshot } from "./state-table.js";
 
 describe("parquet snapshots", () => {
+  it("a state snapshot reads back one row group at a time, in order, equal to the whole read", async () => {
+    const rows: [string, { a: number }][] = Array.from({ length: 2 * ROW_GROUP_SIZE + 7 }, (_, i) => [`k${String(i).padStart(6, "0")}`, { a: i }]);
+    const buf = await writeStateSnapshot("t", rows);
+    const { table, groups } = await readStateSnapshotGroups(bytesBuffer(buf));
+    const sizes: number[] = [];
+    const got: [string, unknown][] = [];
+    for await (const g of groups) {
+      sizes.push(g.length);
+      got.push(...g);
+    }
+    expect(table).toBe("t");
+    expect(sizes).toEqual([ROW_GROUP_SIZE, ROW_GROUP_SIZE, 7]);
+    expect(got).toEqual(rows);
+    await expect(readStateSnapshotGroups(bytesBuffer(await writeParquetRows([{ name: "key", type: "STRING", nullable: false }], [], () => ({}))))).rejects.toThrow(/hopstore.table/);
+  });
+
   it("snapshot parquet round-trips 100k entries", async () => {
     const rows: [string, { amount: string; n: number }][] = Array.from({ length: 100_000 }, (_, i) => [`k${String(i).padStart(6, "0")}`, { amount: String(BigInt(i) * 10n ** 18n), n: i }]);
     const buf = await writeStateSnapshot("balances", rows);

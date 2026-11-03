@@ -112,14 +112,24 @@ rather than silently dropping it.
 - **Ranked indexes** are maintained from a state table on every put and delete: a spec maps each row to a
   `(group, member, score)` with a `bigint` score. Per group, members are kept ordered by score (descending, ties by
   member ascending) with a running sum, so `top(group, n)`, `count(group)` and `sum(group)` are cheap. By default only
-  positive scores are ranked (a zero balance is not a holder); `minScore` changes that. Indexes are not stored; they
-  are rebuilt on open.
+  positive scores are ranked (a zero balance is not a holder); `minScore` changes that. A change costs O(log n + 512)
+  (each group is a list of sorted blocks; small blocks merge, an emptied group is dropped), a few microseconds even on
+  millions of members. `top(group, n)` takes `Math.floor(n)`, and a non-finite or negative `n` gives nothing (Infinity:
+  everything). Indexes are not stored; they
+  are rebuilt on open. State snapshots are read one row group (10,000 rows) at a time on open, so peak memory stays
+  close to the table itself (`bench/snapshot-load.ts`).
 - **Log tables** hold append-only rows per partition, ordered by a sort key (a non-empty array of strings and finite
   numbers, compared element by element). The newest `keepPerPartition` rows of each partition stay in memory for
   `latest(partition, n)`; older rows wait in memory until `sealLogs()` moves them into sorted Parquet segments on S3.
   `scan({ partition, from, to })` merges memory with those segments, reading segments by range or from a local cache.
+  `compactLogs` merges segments a caller groups (e.g. a day's hourly segments into one) into one sorted segment,
+  published in place of its inputs: scans return the same rows in the same order (equal keys stay oldest first),
+  inputs are deleted only after the publish and never while a scan that may read them runs.
   `sealLogs` selects rows by sort key (`olderThanSort`) or content (`where`), and `evict` also takes rows from the
-  newest ones (age-based eviction).
+  newest ones (age-based eviction). A `codec` holds each row in memory as one packed string (often a third of an
+  array's size or less) and decodes it on every read; WAL, snapshots and segments still hold the rows as JSON, so a
+  codec can be added, changed or removed on an existing store. A commit checks that the codec gives each row back,
+  and so does loading a snapshot or replaying the WAL: a stored row the codec does not give back is held unpacked.
 
 ### Commits and durability
 
@@ -138,7 +148,7 @@ data and an input cursor in the same batch and resume from the cursor after a re
 
 ### Snapshots
 
-`snapshot()` (also on a timer, every `snapshotEveryMs`, default 10 minutes, and on `close()`) writes every table as
+`snapshot()` (also on a timer, `snapshotEveryMs` after the last snapshot or seal that sealed rows, default 10 minutes, and on `close()`) writes every table as
 Parquet at one batch number, publishes a manifest naming it, then deletes the WAL objects, snapshots and segments that
 manifest no longer needs. The capture is synchronous and cheap; encoding runs one 10,000-row group at a time with the
 event loop free in between, so commits and reads go on during a snapshot. State snapshots have the columns `key` and
@@ -171,7 +181,9 @@ class Store {
   flush(): Promise<void>; // publish everything committed so far now
   snapshot(): Promise<void>;
   sealLogs(opts?: SealOptions): Promise<number>; // rows sealed
-  close(): Promise<void>; // flush + snapshot (unless fenced), then stop timers and close the WAL
+  compactLogs(opts: CompactOptions): Promise<number>; // merges segments of a log table; returns how many fewer
+  sealsInDoubt(): number; // failed seals that may still land (a later publish adopting one drops its rows from memory)
+  close(): Promise<void>; // waits for compactions in flight, flush + snapshot (unless fenced), then stop timers and close the WAL
   describe(): StoreInfo; // manifest seq, epoch, sequence numbers and per-table counts, from memory
 
   stateTable<V extends Json = Json>(name: string): StateTable<V>;
@@ -226,12 +238,29 @@ interface LogSpec {
   name: string;
   keepPerPartition: number; // integer >= 0
   sortKey: (row: Json) => SortKey;
+  codec?: RowCodec; // rows held in memory packed; reads decode them
+}
+
+interface RowCodec {
+  pack(row: Json): string; // the row's memory form
+  unpack(packed: string): Json; // must give back the row exactly (as JSON)
+}
+
+interface CompactOptions {
+  table: string;
+  group: (segment: { sortMin; sortMax; partitionMin; partitionMax; rows; size }) => string | null; // null: leave it
+  maxRows?: number; // rows per merged segment at most (default 1,000,000)
+  maxRuns?: number; // merged segments per call at most
+  consecutive?: boolean; // default true; false merges a group across the seal order (tables with unique keys)
 }
 
 interface SealOptions {
+  tables?: string[]; // only these log tables (default: all); the others keep their rows and get no callbacks
   olderThanSort?: SortKey; // waiting rows with a lower sort key
-  where?: (row: Json) => boolean; // waiting rows it accepts
-  evict?: (row: Json) => boolean; // any row in memory it accepts, the newest included
+  where?: (row: Json, partition: string, table: string) => boolean; // waiting rows it accepts
+  evict?: (row: Json, partition: string, table: string) => boolean; // any row in memory it accepts, the newest included
+  withOps?(sealed: [partition: string, row: Json, table?: string][]): Op[]; // ops built from exactly the sealed rows, published with the seal
+  packed?: boolean; // where, evict and withOps get a codec table's packed strings (no decoding per row)
 }
 
 type Op =
@@ -255,7 +284,8 @@ only, and cannot be empty, `.` or `..` (so no leading `/` and no `//`). `localDi
 
 Values you read are deeply frozen: the store keeps its own decoded copy of every committed value, so mutating the
 objects you passed to `commit` afterwards is safe, and mutating a value you read throws a `TypeError` (in strict mode,
-which ES modules always are). To change a value, commit a changed copy.
+which ES modules always are). To change a value, commit a changed copy. Rows of a log table with a codec are the
+exception: each read decodes a new copy, which is yours (changing it changes nothing in the store).
 
 ### Table views
 
@@ -293,9 +323,11 @@ readonly name: string;
 readonly size: number; // rows in memory
 latest(partition: string, n: number, keep?: (row: R) => boolean): R[]; // newest first, at most keepPerPartition
 scan(range: { partition?: string; from: SortKey; to: SortKey }): AsyncIterable<R>; // from <= sort < to, memory + segments
+scanEntries(range: { partition?: string; from: SortKey; to: SortKey }): AsyncIterable<[string, R]>; // scan, with each row's partition
 partitions(): IterableIterator<string>; // partitions with rows in memory
 memoryRows(partition: string): IterableIterator<R>; // rows in memory, ascending
-rowsInMemory(partition: string): IterableIterator<R>; // the same, unordered and without copying
+rowsInMemory(partition: string): IterableIterator<R>; // the same, unordered and without copying the list
+packedRowsInMemory(partition: string): IterableIterator<Json>; // rowsInMemory as held: packed strings with a codec
 has(partition: string, sortKey: SortKey): boolean; // memory only
 ```
 
